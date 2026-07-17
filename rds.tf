@@ -4,7 +4,7 @@ data "aws_db_snapshot" "latest_prod_snapshot" {
 }
 
 resource "aws_db_subnet_group" "clixx" {
-  name       = "clixx-db-subnet-group"
+  name       = "ecs-db-subnet-group"
   subnet_ids = [aws_subnet.private-subnet-a.id, aws_subnet.private-subnet-b.id]
 }
 

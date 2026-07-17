@@ -1,57 +1,60 @@
-# stack-aut-Clixx
+# stack-ecs-clixx
 
-Terraform stack that provisions the full AWS runtime for **CliXX Retail**, a WordPress application. It runs **two parallel deployment paths** side by side in the same VPC — a classic Auto Scaling Group of EC2 instances, and an ECS cluster on EC2 capacity — each behind its own ALB and backed by its own RDS database restored from a shared snapshot. A Jenkins pipeline (`Jenkinsfile`) drives `init`/`plan`/`apply`/`destroy`, runs an AI source-code audit step, and posts status to Slack.
+Terraform stack that runs **CliXX Retail** (a WordPress application) as a containerized service on **Amazon ECS with EC2 capacity**. It provisions its own VPC, an ALB fronting an ECS service backed by an EC2 Auto Scaling Group (ECS-optimized AMI, bridge networking), and an RDS instance restored from a shared snapshot. A Jenkins pipeline (`Jenkinsfile`) drives `init`/`plan`/`apply`/`destroy`, runs an AI source-code audit step before applying, and posts status to Slack.
 
-See **[docs/asg-stack.md](docs/asg-stack.md)** and **[docs/ecs-stack.md](docs/ecs-stack.md)** for the full architecture, resources, and caveats of each stack. This README covers what's shared between them plus how to deploy.
-
----
+This directory is a standalone ECS deployment — it does not include the classic EC2/Auto Scaling Group WordPress tier (that lives in the separate `stack-aut-clixx` project).
 
 ## Architecture
 
 ```
-                                    Internet
-                                        │
-                    ┌───────────────────┴───────────────────┐
-                    ▼                                       ▼
-        tf-lb (ASG stack ALB, :443)              ecs-lb (ECS stack ALB, :443)
-        asg.clixx.example.com                ecs.clixx.example.com
-                    │                                       │
-              Target Group tf-tg                      Target Group ecs-tg
-                    │                                       │
-             ASG tf-asg (1-2)                        ECS Service on ecs-asg (1-2)
-          EC2, custom AMI, EFS-backed              EC2 (ECS-optimized AMI), bridge mode,
-                    │                               container from ECR, dynamic host ports
-                    ▼                                       ▼
-        RDS clixx-restored                    RDS clixx-restored-ecs
-     (restored from clixx-working-snapshot)  (restored from the same snapshot, separate instance)
+                                Internet
+                                    │
+                                    ▼
+                        ecs-lb (ALB, :80 → :443 redirect, :443)
+                        ecs.clixx.example.com
+                                    │
+                          Target Group ecs-tg (port 80)
+                                    │
+                     ECS Service "clixx" on ECS capacity provider
+                   (EC2 ASG "ecs-asg", 1-3 instances, bridge mode,
+                    container from ECR, dynamic host port mapping)
+                                    │
+                                    ▼
+                       RDS clixx-restored-ecs (db.m5.large)
+                    restored from snapshot clixx-snapshot-has-user
 
-  Bastion host (public subnet) ── SSH access into the private network, shared by both stacks
+        Bastion host (public subnet) ── SSH access into the private subnets
 ```
 
-Both stacks share the same VPC/networking (`vpc.tf`), security groups (`security.tf`), bastion host, and source DB snapshot — everything downstream of the ALB is independent per stack. See the sub-docs for the full resource breakdown of each.
+CloudWatch alarms (CPU/memory/disk on the ECS ASG) and a dashboard feed an SNS topic that emails the admins in `var.admin_emails`.
 
-## Shared foundation
+## Resources
 
 | Area | File | Notes |
 |---|---|---|
-| Networking | [vpc.tf](vpc.tf) | VPC (`10.1.0.0/16`), 2 public + 2 private subnets across 2 AZs, IGW, NAT gateway, route tables, S3 gateway endpoint. |
-| Security groups | [security.tf](security.tf) | `clixx-sg` (app instances, both stacks), `alb-sg` (shared by both ALBs), bastion SG, EFS SG, DB SG — least-privilege ingress scoped to the relevant SG rather than open CIDRs (except the ALBs' public `:80`/`:443`). |
-| Bastion | [ec2.tf](ec2.tf) | Public-subnet EC2 instance for SSH access into the private subnets — the quickest place to run one-off `wp-cli` commands against either stack's DB. |
-| Data sources | [data.tf](data.tf) | SSM parameters (DB password, org name, role name, git repo URL, instance profile ARN), the ASG/ECS AMIs, the ECR repo (cross-account), and the Route 53 zone. |
+| Networking | [vpc.tf](vpc.tf) | VPC (`20.1.0.0/16`), 2 public + 2 private subnets across `us-east-1a`/`b`, IGW, one NAT gateway per AZ, public/private route tables, S3 gateway endpoint. |
+| Security groups | [security.tf](security.tf) | `clixx-sg` (ECS container instances — SSH from the VPC CIDR, HTTP + the ECS dynamic port range `32768-65535` from `alb-sg`), `alb-sg` (public `:80`/`:443`), `bastion-sg` (SSH open to `0.0.0.0/0`), `db-sg` (`3306` from `clixx-sg` and `bastion-sg` only). |
+| Bastion | [ec2.tf](ec2.tf) | Public-subnet `t3.micro` (hardcoded AMI) for SSH access into the private subnets — also defines the ALB, target group, and HTTP/HTTPS listeners. |
+| ECS | [ecs.tf](ecs.tf) | `ecs_instance_role`/`ecs_instance_profile` (ECS-for-EC2, CloudWatch Agent, SSM policies), ECS cluster, capacity provider tied to `ecs-asg`, task definition (bridge networking, container from `clixx-repository:${var.ecr_image_tag}`, WordPress DB env vars, `WP_HOME`/`WP_SITEURL` hardcoded to the ECS URL), and the service (spread placement by AZ then instance). |
+| Database | [rds.tf](rds.tf) | `clixx-restored-ecs` (`db.m5.large`), restored from the most recent `clixx-snapshot-has-user` snapshot, in its own DB subnet group, not publicly accessible. |
+| DNS | [route53.tf](route53.tf) | `ecs.clixx.example.com` alias record pointing at `ecs-lb`. |
+| Monitoring | [cloudwatch.tf](cloudwatch.tf), [sns.tf](sns.tf) | CPU/memory/disk alarms on the ECS ASG, a `clixx-esg-dashboard` dashboard, and an SNS topic (`clixx-ecs-warnings`) emailing `var.admin_emails`. |
+| Data sources | [data.tf](data.tf) | SSM parameters (DB password, org name, role name, git repo URL), the ECS-optimized AMI, the cross-account ECR repo, the Route 53 zone, and the running ECS instances (for the private-IP output). |
+| Config | [vars.tf](vars.tf), [locals.tf](locals.tf), [provider.tf](provider.tf), [versions.tf](versions.tf) | Variables/defaults, the two AWS provider configs (default `stackprog-dev` profile plus an `aws.ecs-repo-account` alias on `stackprog-aut` for the cross-account ECR lookup), and the S3 remote-state backend. |
 
 ## Deploying
 
 ### Via Jenkins (primary path)
 
-The [Jenkinsfile](Jenkinsfile) runs against this directory:
+The [Jenkinsfile](Jenkinsfile) runs against this directory, parameterized by `ACTION` (`apply` or `destroy`):
 
-1. **AI Source Code Audit** (apply only) — an unattended Claude Code agent scans for hardcoded secrets and fixes minor `.tf` syntax issues, then commits/tags/opens a PR if it changed anything; stops without proceeding if secrets are found. See **[docs/ci-cd-pipeline.md](docs/ci-cd-pipeline.md)** for the full stage-by-stage breakdown — this stage has real teeth (it can push branches and open PRs on its own) and is worth understanding before relying on it.
+1. **AI Source Code Audit** (apply only) — an unattended Claude Code agent (prompt in [ai-source-audit-prompt.txt](ai-source-audit-prompt.txt)) scans for hardcoded secrets and fixes minor `.tf` syntax issues, then commits/tags/opens a PR if it changed anything; stops without proceeding if secrets are found.
 2. **Terraform Init** — `terraform init -upgrade`, Slack notification.
 3. **Terraform Plan** — `terraform plan -out=tfplan` (`-destroy` when tearing down).
-4. **Terraform Apply** — applies the plan, posts the live `clixx_asg_url`/`clixx_ecs_url` outputs to Slack.
-5. **Terraform Destroy** — `terraform destroy -auto-approve`.
+4. **Terraform Apply** — applies the plan, posts the live `clixx_ecs_url` output to Slack.
+5. **Terraform Destroy** — first targets `aws_ecs_service.clixx`, `aws_ecs_cluster_capacity_providers.clixx-ccp`, and `aws_ecs_capacity_provider.clixx-cp` to unwind the ECS/ASG dependency cleanly, then runs a full `terraform destroy`.
 
-Trigger the job with the `ACTION` parameter set to `apply` or `destroy`.
+Slack notifications (start, deploy complete, destroy complete, and pass/fail) post to `#stackjenkins`.
 
 ### Manually
 
@@ -61,14 +64,14 @@ terraform plan -out=tfplan
 terraform apply tfplan
 ```
 
+Requires the `stackprog-dev` AWS CLI profile (and `stackprog-aut` for the cross-account ECR data source) configured locally.
+
 ## Outputs
 
 | Output | Description |
 |---|---|
-| `clixx_asg_url` | Public URL for the ASG stack (`https://asg.clixx.example.com`). |
-| `clixx_ecs_url` | Public URL for the ECS stack (`https://ecs.clixx.example.com`). |
+| `clixx_ecs_url` | Public URL for the app (`https://ecs.clixx.example.com`). |
 | `bastion_ip` | Public IP of the bastion host. |
-| `clixx_priv_ips` | Private IPs of the running ASG instances. |
 | `clixx_ecs_priv_ips` | Private IPs of the running ECS container instances. |
 
 ## Prerequisites
@@ -76,28 +79,19 @@ terraform apply tfplan
 Provisioned outside this stack, and expected to already exist:
 
 - An IAM role Terraform assumes to deploy (`ROLE_NAME`, read from SSM `/stack/role`).
-- Two custom AMIs: `ami-stack-*` (ASG stack, built by the [packer](../packer) pipeline) and `ami-ecs-stack-*` (ECS stack, built by the `ECS-AMI-BUILD` pipeline) — both owned by `var.ami_owner_account_id`.
-- The `clixx-repository` ECR repo populated with the app image, in the account behind the `aws.ecs-repo-account` provider alias.
-- A DB snapshot named `clixx-working-snapshot` in the target account/region — both stacks restore their own independent RDS instance from it.
-- An IAM instance profile (SSM `/stack/instanceProfile`) granting the ASG instances permission to read SSM parameters, mount EFS, and reach RDS.
-- SSM parameters: `/stack/orgname`, `/stack/role`, `/stack/clixx/repo`, `/stack/instanceProfile`, `/stack/clixx/db_password` (SecureString).
+- A custom ECS-optimized AMI named `ami-ecs-stack-*`, owned by `var.ami_owner_account_id`.
+- The `clixx-repository` ECR repo populated with the app image, in the account behind the `aws.ecs-repo-account` provider alias (`stackprog-aut`).
+- A DB snapshot named `clixx-snapshot-has-user` in the target account/region — `clixx-restored-ecs` restores from it.
+- SSM parameters: `/stack/orgname`, `/stack/role`, `/stack/clixx/repo`, `/stack/clixx/db_password` (SecureString).
 - An S3 bucket for remote state (`enoch-tf-state-bucket`, see [versions.tf](versions.tf)).
 - A Route 53 hosted zone (`clixx.example.com`).
-- An ACM certificate covering `*.clixx.example.com` in `us-east-1`, shared by both ALBs' HTTPS listeners.
+- An ACM certificate covering `*.clixx.example.com` in `us-east-1` — its ARN is hardcoded in [ec2.tf](ec2.tf) rather than looked up, so it's tied to this specific account.
 - An EC2 key pair (`var.key_name`, default `dev-servers`) for bastion/instance SSH access.
 
 ## Known caveats
 
-- `skip_final_snapshot = true` on both RDS instances means a `terraform destroy` throws away the live databases without a final snapshot — fine since the source snapshot is the durable copy, but any writes since the last restore are lost.
-- EBS volumes are `encrypted = false` — tighten before this carries anything beyond dev data.
-- `force_delete = true` on both ASGs and the ECS service is convenient for iterating in dev but should not be carried into a production stack as-is.
-- See [docs/asg-stack.md](docs/asg-stack.md#known-caveats) and [docs/ecs-stack.md](docs/ecs-stack.md#known-caveats) for stack-specific caveats.
-
-## Further reading
-
-- [docs/asg-stack.md](docs/asg-stack.md) — ASG/EC2 stack deep dive.
-- [docs/ecs-stack.md](docs/ecs-stack.md) — ECS stack deep dive.
-- [docs/ci-cd-pipeline.md](docs/ci-cd-pipeline.md) — Jenkins pipeline deep dive, including the AI Source Code Audit stage's secret-scan/syntax-fix/auto-PR flow.
-- [docs/stack-Clixx.md](docs/stack-Clixx.md) — original design writeup (partially historical, predates the ECS stack).
-- [docs/architecture.png](docs/architecture.png) — original architecture diagram (ASG stack only).
-- `docs/v1.x-*.md` — version history tracking how the stack evolved.
+- `skip_final_snapshot = true` on the RDS instance means a `terraform destroy` throws away the live database without a final snapshot — fine since the source snapshot is the durable copy, but any writes since the last restore are lost.
+- `force_delete = true` on both the ECS ASG and the ECS service is convenient for iterating in dev but should not be carried into a production stack as-is.
+- `bastion-sg` allows SSH from `0.0.0.0/0`, unlike the rest of the stack's least-privilege security groups — worth tightening to a known CIDR.
+- The bastion AMI ID and the HTTPS listener's ACM certificate ARN are hardcoded rather than looked up via data sources, so this stack isn't portable to another account/region without editing [ec2.tf](ec2.tf) directly.
+- The commented-out root-domain Route 53 record in [route53.tf](route53.tf) suggests `clixx.example.com` (no subdomain) was once meant to point here too; currently only `ecs.clixx.example.com` is wired up.

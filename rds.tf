@@ -1,0 +1,22 @@
+data "aws_db_snapshot" "latest_prod_snapshot" {
+  db_snapshot_identifier = "clixx-snapshot-has-user"
+  most_recent            = true
+}
+
+resource "aws_db_subnet_group" "clixx" {
+  name       = "clixx-db-subnet-group"
+  subnet_ids = [aws_subnet.private-subnet-a.id, aws_subnet.private-subnet-b.id]
+}
+
+###### ECS DB CLUSTER
+resource "aws_db_instance" "clixx-ecs-db" {
+  identifier             = "clixx-restored-ecs"
+  instance_class         = "db.m5.large"
+  snapshot_identifier    = data.aws_db_snapshot.latest_prod_snapshot.id
+  db_subnet_group_name   = aws_db_subnet_group.clixx.name
+  vpc_security_group_ids = [aws_security_group.db-sg.id]
+  availability_zone      = "${var.AWS_REGION}b"
+  publicly_accessible    = false
+  multi_az               = false
+  skip_final_snapshot    = true
+}

@@ -16,7 +16,6 @@ variable "usage" {
 variable "admin_emails" {
   type = set(string)
   default = [
-    "devops-alerts@example.com",
     "devops-alerts@example.com"
   ]
 }
@@ -60,4 +59,10 @@ variable "key_name" {
   description = "Key pair name for EC2 instances"
   type        = string
   default     = "dev-servers"
+}
+
+variable "bastion_ssh_cidr" {
+  description = "CIDR allowed to SSH into the bastion host — restrict to your admin IP range"
+  type        = string
+  default     = "203.0.113.0/24" # RFC 5737 documentation range — replace with a real admin CIDR
 }
